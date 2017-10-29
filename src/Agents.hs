@@ -6,14 +6,14 @@ import           Data.Binary
 import           Data.Typeable
 import Control.Concurrent (threadDelay)
 import Control.Distributed.Process
-import Control.Monad (replicateM,replicateM_,void,unless)
+import Control.Monad (replicateM, replicateM_, unless, when)
 import Data.Maybe (fromJust)
 
-master :: Int -> Int -> Process ()
-master a p = do
+master :: Bool -> Int -> Int -> Process ()
+master neg a p = do
   say "Hello, I`m the master"
   selfPid <- getSelfPid
-  lsAcceptors <- replicateM a $ spawnLocal $ acceptor selfPid
+  lsAcceptors <- replicateM a $ spawnLocal $ acceptor neg selfPid
   replicateM_ p $ spawnLocal $ proposer lsAcceptors (div a 2 + 1)
   cmds <- replicateM a waitExecuted
   say $ show cmds
@@ -31,13 +31,13 @@ master a p = do
 
 type AcceptState = (Time,Time,Maybe Command)
 
-acceptor :: ProcessId -> Process ()
-acceptor masterPid = do
+acceptor :: Bool -> ProcessId -> Process ()
+acceptor neg masterPid = do
   say "Hello, I`m an acceptor"
-  acceptWithState masterPid (0, 0, Nothing)
+  acceptWithState neg masterPid (0, 0, Nothing)
 
-acceptWithState :: ProcessId -> AcceptState -> Process ()
-acceptWithState masterPid s@(tMax,tStore,mcmd) = do
+acceptWithState :: Bool -> ProcessId -> AcceptState -> Process ()
+acceptWithState sendNeg masterPid s@(tMax,tStore,mcmd) = do
   selfPid <- getSelfPid
   let
     prep :: Prepare -> Process ()
@@ -47,9 +47,10 @@ acceptWithState masterPid s@(tMax,tStore,mcmd) = do
       then do
         sayAndSend pid $ Promise tStore mcmd selfPid
         say $ "Setting Tmax = " ++ show t
-        acceptWithState masterPid (t, tStore, mcmd)
-      else
-        acceptWithState masterPid s
+        acceptWithState sendNeg masterPid (t, tStore, mcmd)
+      else do
+        when sendNeg $ sayAndSend pid PromiseNotOk
+        acceptWithState sendNeg masterPid s
     prop :: Propose -> Process ()
     prop m@(Propose t cmd pid) = do
       say $ "Got " ++  show m
@@ -58,18 +59,21 @@ acceptWithState masterPid s@(tMax,tStore,mcmd) = do
         say $ "Setting Tstore = " ++ show t
         say $ "Setting cmd = " ++ show cmd
         sayAndSend pid $ Proposal True
-        acceptWithState masterPid (t, t, Just cmd)
-        else
-          acceptWithState masterPid s
+        acceptWithState sendNeg masterPid (t, t, Just cmd)
+      else do
+        when sendNeg $ sayAndSend pid $ Proposal False
+        acceptWithState sendNeg masterPid s
     exec :: Execute -> Process ()
     exec m@(Execute cmd) = do
       say $ "Got " ++ show m
       send masterPid $ Executed cmd
+      loop
+    loop = loop
 
   say "Waiting..."
   receiveWait [match prep, match prop, match exec]
 
-type PromiseState = (Time, Maybe Command, [ProcessId], Int)
+type PromiseState = (Time, Maybe Command, [ProcessId], Int, Int)
 
 proposer :: [ProcessId] -> Int -> Process ()
 proposer ls majority = do
@@ -77,18 +81,19 @@ proposer ls majority = do
   selfPid <- getSelfPid
   let cmd = selfPid
       time = 1
-      prep = Prepare time selfPid
       prepareLoop t = do
+        let prep = Prepare t selfPid
         broadcast ls prep
         reached <- waitPromise ls selfPid majority t cmd
+        liftIO $ threadDelay 20000000
         unless reached $ prepareLoop $ t + 1
   prepareLoop time
 
 waitPromise :: [ProcessId] -> ProcessId -> Int -> Time -> Command -> Process Bool
-waitPromise ls selfPid majority myTime myCmd = go (0, Nothing, [], 0)
+waitPromise ls selfPid majority myTime myCmd = go (0, Nothing, [], 0, 0)
   where
     go :: PromiseState -> Process Bool
-    go (time, mcmd, promLs, promCount) = do
+    go (time, mcmd, promLs, promCount, promFailCount) = do
       timerPid <- setTimer 200000000 selfPid
       let
         prom :: PromiseOk -> Process Bool
@@ -105,28 +110,46 @@ waitPromise ls selfPid majority myTime myCmd = go (0, Nothing, [], 0)
             let cmd = if time > 0 then fromJust mcmd else myCmd
             broadcast newPromLs $ Propose myTime cmd selfPid
             waitSuccess ls selfPid majority myTime cmd
-          else go (newTime,newMcmd,newPromLs,newPromCount)
+          else go (newTime,newMcmd,newPromLs,newPromCount, promFailCount)
+        failProm :: PromiseNotOk -> Process Bool
+        failProm pr = do
+          say $ "Got " ++ show pr
+          let newPromFailCount = promFailCount + 1
+          if newPromFailCount >= majority
+          then do
+            kill timerPid "Got PromiseNotOk majority. Kill the timer!"
+            return False
+          else go (time, mcmd, promLs, promCount, newPromFailCount)
+
       say "Waiting promise ..."
-      receiveWait [match timeOut, match prom]
+      receiveWait [match timeOut, match prom, match failProm]
 
 
 waitSuccess :: [ProcessId] -> ProcessId -> Int -> Time -> Command -> Process Bool
-waitSuccess ls selfPid majority myTime cmd = go 0
+waitSuccess ls selfPid majority myTime cmd = go 0 0
   where
-    go :: Int -> Process Bool
-    go succCount = do
+    go :: Int -> Int -> Process Bool
+    go succCount failCount = do
       timerPid <- setTimer 20000000 selfPid
       let
         success :: Proposal -> Process Bool
-        success _ = do
+        success pr@(Proposal True) = do
           let newSuccCount = succCount + 1
-          say $ "Got success " ++ show newSuccCount
+          say $ "Got " ++ show pr ++ " " ++ show newSuccCount
           if newSuccCount >= majority
           then do
             kill timerPid "Got success majority. Kill the timer!"
             broadcast ls $ Execute cmd
             return True
-          else go newSuccCount
+          else go newSuccCount failCount
+        success (Proposal False) = do
+          let newFailCount = failCount + 1
+          say $ "Got " ++ show newFailCount
+          if newFailCount >= majority
+          then do
+            kill timerPid "Got Fail majority. Kill the timer!"
+            return False
+          else go succCount newFailCount
       say "Waiting success ..."
       receiveWait [match timeOut, match success]
 
