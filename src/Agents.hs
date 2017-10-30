@@ -1,3 +1,4 @@
+{-# LANGUAGE RecordWildCards #-}
 module Agents where
 
 import Message
@@ -29,49 +30,52 @@ master neg a p = do
         say $ "Got " ++ show ex
         return cmd
 
-type AcceptState = (Time,Time,Maybe Command)
+data AcceptState = AcceptState {
+    tMax   :: Time
+  , tStore :: Time
+  , mcmd   :: Maybe Command}
 
 acceptor :: Bool -> ProcessId -> Process ()
-acceptor neg masterPid = do
+acceptor sendNeg masterPid = do
   say "Hello, I`m an acceptor"
-  acceptWithState neg masterPid (0, 0, Nothing)
+  go $ AcceptState 0 0 Nothing
+  where
+    go :: AcceptState -> Process ()
+    go s@AcceptState{..} = do
+      selfPid <- getSelfPid
+      let
+        prep :: Prepare -> Process ()
+        prep m@(Prepare t pid) = do
+          say $ "Got " ++  show m
+          if t > tMax
+          then do
+            sayAndSend pid $ Promise tStore mcmd selfPid
+            say $ "Setting Tmax = " ++ show t
+            go $ AcceptState t tStore mcmd
+          else do
+            when sendNeg $ sayAndSend pid PromiseNotOk
+            go s
+        prop :: Propose -> Process ()
+        prop m@(Propose t cmd pid) = do
+          say $ "Got " ++  show m
+          if t == tMax
+          then do
+            say $ "Setting Tstore = " ++ show t
+            say $ "Setting cmd = " ++ show cmd
+            sayAndSend pid $ Proposal True
+            go $ AcceptState t t $ Just cmd
+          else do
+            when sendNeg $ sayAndSend pid $ Proposal False
+            go s
+        exec :: Execute -> Process ()
+        exec m@(Execute cmd) = do
+          say $ "Got " ++ show m
+          send masterPid $ Executed cmd
+          loop
+        loop = loop
+      say "Waiting..."
+      receiveWait [match prep, match prop, match exec]
 
-acceptWithState :: Bool -> ProcessId -> AcceptState -> Process ()
-acceptWithState sendNeg masterPid s@(tMax,tStore,mcmd) = do
-  selfPid <- getSelfPid
-  let
-    prep :: Prepare -> Process ()
-    prep m@(Prepare t pid) = do
-      say $ "Got " ++  show m
-      if t > tMax
-      then do
-        sayAndSend pid $ Promise tStore mcmd selfPid
-        say $ "Setting Tmax = " ++ show t
-        acceptWithState sendNeg masterPid (t, tStore, mcmd)
-      else do
-        when sendNeg $ sayAndSend pid PromiseNotOk
-        acceptWithState sendNeg masterPid s
-    prop :: Propose -> Process ()
-    prop m@(Propose t cmd pid) = do
-      say $ "Got " ++  show m
-      if t == tMax
-      then do
-        say $ "Setting Tstore = " ++ show t
-        say $ "Setting cmd = " ++ show cmd
-        sayAndSend pid $ Proposal True
-        acceptWithState sendNeg masterPid (t, t, Just cmd)
-      else do
-        when sendNeg $ sayAndSend pid $ Proposal False
-        acceptWithState sendNeg masterPid s
-    exec :: Execute -> Process ()
-    exec m@(Execute cmd) = do
-      say $ "Got " ++ show m
-      send masterPid $ Executed cmd
-      loop
-    loop = loop
-
-  say "Waiting..."
-  receiveWait [match prep, match prop, match exec]
 
 type PromiseState = (Time, Maybe Command, [ProcessId], Int, Int)
 
